@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-SDN Controller with OpenFlow 1.3 Protocol - Built from Scratch
+SDN Controller with OpenFlow 1.3 Protocol
 Includes REST API for Intent-Based Networking
-No external SDN frameworks - pure Python implementation
 """
 
 import socket
