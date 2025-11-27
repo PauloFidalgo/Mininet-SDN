@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-SDN Controller with OpenFlow 1.3 Protocol
+SDN Controller with OpenFlow 1.3 Protocol - Built from Scratch
 Includes REST API for Intent-Based Networking
+No external SDN frameworks - pure Python implementation
 """
 
 import socket
@@ -460,9 +461,16 @@ class SDNController:
                 'eth_dst': eth_dst
             }
             actions = [{'type': 'output', 'port': out_port}]
-            flow_mod = OFPMessage.create_flow_mod(match, actions, priority=priority, idle_timeout=30)
+            
+            # If there's a priority intent, make flow permanent (no timeout)
+            if priority != 10:
+                flow_mod = OFPMessage.create_flow_mod(match, actions, priority=priority, idle_timeout=0, hard_timeout=0)
+                logger.info(f"Flow installed: {eth_src} -> {eth_dst} out_port={out_port} priority={priority} (PERMANENT)")
+            else:
+                flow_mod = OFPMessage.create_flow_mod(match, actions, priority=priority, idle_timeout=30)
+                logger.info(f"Flow installed: {eth_src} -> {eth_dst} out_port={out_port} priority={priority}")
+            
             switch.send(flow_mod)
-            logger.info(f"Flow installed: {eth_src} -> {eth_dst} out_port={out_port} priority={priority}")
         
         # Send packet out
         if out_port is not None:
@@ -539,11 +547,79 @@ class SDNController:
         self.intents.append(intent)
         logger.info(f"Intent added: {intent}")
         
-        # Apply block intent immediately
-        if intent['type'] == 'block' and intent['enabled']:
-            self.apply_block_intent(intent)
+        # Apply intent immediately based on type
+        if intent['enabled']:
+            if intent['type'] == 'block':
+                self.apply_block_intent(intent)
+            elif intent['type'] == 'priority':
+                self.apply_priority_intent(intent)
+            elif intent['type'] == 'redirect':
+                self.apply_redirect_intent(intent)
         
         return intent
+    
+    def apply_redirect_intent(self, intent):
+        """Apply redirect intent to all switches"""
+        src_mac = intent.get('src_mac')
+        dst_mac = intent.get('dst_mac')
+        out_port = intent.get('out_port')
+        
+        for dpid, switch in self.switches.items():
+            # First, delete any existing flows for this src/dst pair
+            match_delete = {'eth_src': src_mac, 'eth_dst': dst_mac}
+            flow_delete = OFPMessage.create_flow_mod(match_delete, [], priority=10, command=OFPFC_DELETE)
+            switch.send(flow_delete)
+            logger.info(f"Deleted existing flows for {src_mac} -> {dst_mac} on switch {dpid}")
+            
+            # Get source port if known
+            src_port = switch.mac_table.get(src_mac)
+            
+            if src_port:
+                # Install redirect flow with high priority
+                match = {
+                    'in_port': src_port,
+                    'eth_src': src_mac,
+                    'eth_dst': dst_mac
+                }
+                actions = [{'type': 'output', 'port': out_port}]
+                # Use high priority to override normal forwarding
+                flow_mod = OFPMessage.create_flow_mod(match, actions, priority=50, idle_timeout=0, hard_timeout=0)
+                switch.send(flow_mod)
+                logger.info(f"Redirect flow installed on switch {dpid}: {src_mac} -> {dst_mac} via port {out_port} (priority=50, permanent)")
+            else:
+                logger.info(f"Redirect intent registered for {src_mac} -> {dst_mac}, will apply when topology is learned")
+    
+    def apply_priority_intent(self, intent):
+        """Apply priority intent to all switches"""
+        src_mac = intent.get('src_mac')
+        dst_mac = intent.get('dst_mac')
+        priority = intent.get('priority', 10)
+        
+        for dpid, switch in self.switches.items():
+            # Check if we know the ports for these MACs
+            src_port = None
+            dst_port = None
+            
+            # Check if MACs are in the switch's MAC table
+            if src_mac in switch.mac_table:
+                src_port = switch.mac_table[src_mac]
+            if dst_mac in switch.mac_table:
+                dst_port = switch.mac_table[dst_mac]
+            
+            # If we don't know the ports yet, the priority will be applied when traffic flows
+            if src_port and dst_port:
+                match = {
+                    'in_port': src_port,
+                    'eth_src': src_mac,
+                    'eth_dst': dst_mac
+                }
+                actions = [{'type': 'output', 'port': dst_port}]
+                # Install with NO idle timeout so priority persists
+                flow_mod = OFPMessage.create_flow_mod(match, actions, priority=priority, idle_timeout=0, hard_timeout=0)
+                switch.send(flow_mod)
+                logger.info(f"Priority flow installed on switch {dpid}: {src_mac} -> {dst_mac} priority={priority}")
+            else:
+                logger.info(f"Priority intent registered, will apply when topology is learned")
     
     def remove_intent(self, intent_id):
         """Remove an intent by ID"""
@@ -568,6 +644,10 @@ class SDNController:
                 
                 if intent['type'] == 'block':
                     self.apply_block_intent(intent)
+                elif intent['type'] == 'priority':
+                    self.apply_priority_intent(intent)
+                elif intent['type'] == 'redirect':
+                    self.apply_redirect_intent(intent)
                 
                 return intent
         return None
@@ -581,9 +661,36 @@ class SDNController:
                 
                 if intent['type'] == 'block':
                     self.clear_block_intent(intent)
+                elif intent['type'] == 'priority':
+                    self.clear_priority_intent(intent)
+                elif intent['type'] == 'redirect':
+                    self.clear_redirect_intent(intent)
                 
                 return intent
         return None
+    
+    def clear_redirect_intent(self, intent):
+        """Remove redirect flows from switches"""
+        src_mac = intent.get('src_mac')
+        dst_mac = intent.get('dst_mac')
+        
+        for dpid, switch in self.switches.items():
+            match = {'eth_src': src_mac, 'eth_dst': dst_mac}
+            flow_mod = OFPMessage.create_flow_mod(match, [], priority=50, command=OFPFC_DELETE)
+            switch.send(flow_mod)
+            logger.info(f"Redirect rule removed from switch {dpid}")
+    
+    def clear_priority_intent(self, intent):
+        """Remove priority flows from switches"""
+        src_mac = intent.get('src_mac')
+        dst_mac = intent.get('dst_mac')
+        
+        for dpid, switch in self.switches.items():
+            match = {'eth_src': src_mac, 'eth_dst': dst_mac}
+            # Send flow_mod with DELETE command
+            flow_mod = OFPMessage.create_flow_mod(match, [], priority=intent.get('priority', 10), command=OFPFC_DELETE)
+            switch.send(flow_mod)
+            logger.info(f"Priority rule removed from switch {dpid}")
     
     def clear_block_intent(self, intent):
         """Remove block flows from switches"""
@@ -646,6 +753,7 @@ class SDNController:
                         self.end_headers()
                 
                 elif self.path == '/api/stats':
+                    # Network statistics
                     stats = {
                         'switches': len(controller.switches),
                         'hosts': len(controller.topology['hosts']),
@@ -736,6 +844,7 @@ class SDNController:
         
         try:
             api_server = HTTPServer(('0.0.0.0', self.api_port), APIHandler)
+            # Set SO_REUSEADDR to avoid "Address already in use" errors
             api_server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             logger.info(f"REST API server started on port {self.api_port}")
             api_server.serve_forever()
